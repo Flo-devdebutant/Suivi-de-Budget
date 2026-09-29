@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="fr">
-<head>
+<head><!--@app-->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Suivi de Budget</title>
@@ -2034,8 +2034,8 @@ body.tour-on .fab{ transition:none; }
   }
 }
 </style>
-</head>
-<body>
+<!--/@app--></head>
+<body><!--@app-->
 
 
 <!-- Icônes -->
@@ -14941,6 +14941,18 @@ $("btnUseOwnProject").addEventListener("click", function(){
    lecture sont reprises après le rechargement ; les données, elles, sont déjà
    enregistrées sur l'appareil à chaque modification.
 
+   Trois précautions empêchent toute boucle de rechargements quand rien n'a
+   été publié :
+     - l'empreinte ne porte que sur le contenu de l'application (entre les
+       repères @app), pas sur ce qu'un antivirus ou un proxy ajoute à la
+       page à chaque requête ;
+     - une nouvelle version n'est retenue que si deux lectures successives
+       la confirment ;
+     - au-delà de quelques rechargements rapprochés, ou si un rechargement
+       n'a pas apporté la version attendue, les rechargements automatiques
+       sont suspendus un moment : la nouvelle version s'affichera simplement
+       à la prochaine ouverture.
+
    Sans service worker (fichier ouvert en local, navigateur ancien), la page
    compare elle-même l'empreinte du fichier en ligne : la mise à jour
    automatique continue de fonctionner, seul le hors-ligne manque. */
@@ -14949,17 +14961,47 @@ var APP_VERSION = (function(){
   return m && m.getAttribute("content") ? m.getAttribute("content") : null;
 })();
 var RESUME_KEY = "suiviBudget.resume";
+var UPDATE_LOG_KEY = "suiviBudget.updateLog";
 var UPDATE_CHECK_EVERY = 2 * 60 * 1000;
+var UPDATE_CONFIRM_DELAY = 4000;              /* ms entre les deux lectures */
+var UPDATE_MAX_RELOADS = 3;                   /* rechargements automatiques… */
+var UPDATE_RELOAD_WINDOW = 15 * 60 * 1000;    /* … au plus par quart d'heure */
+var SW_UPDATE_MIN_GAP = 60 * 1000;
 var updateBaseline = APP_VERSION;
+var updateCandidate = null;
+var updateTarget = null;
 var updatePending = false;
 var updateWaitTimer = null;
+var updateSuspendedUntil = 0;
 var lastUpdateCheck = 0;
+var lastSwUpdate = 0;
 var swRegistration = null;
 var swHadController = false;
 var swOfflineReady = false;
 
-/* Même empreinte que dans sw.js (cyrb53). */
-function empreinteTexte(str){
+/* Même empreinte que dans sw.js (fonction empreinte) : seul compte le
+   contenu placé entre les repères @app, sans les scripts ni les feuilles de
+   style externes qu'un intermédiaire aurait insérés. Les repères et les
+   balises sont écrits en morceaux pour ne pas apparaître tels quels dans ce
+   script — ils seraient pris pour les vrais. */
+var REPERE_DEBUT = "<" + "!--@app-->", REPERE_FIN = "<" + "!--/@app-->";
+var BALISES_EXTERNES = [
+  new RegExp("<scr" + "ipt\\b[^>]*\\bsrc\\s*=\\s*[\"']?(?:https?:)?\\/\\/[^>]*>\\s*<\\/scr" + "ipt\\s*>", "gi"),
+  new RegExp("<link\\b[^>]*\\bhref\\s*=\\s*[\"']?(?:https?:)?\\/\\/[^>]*>", "gi")
+];
+function empreinteTexte(texte){
+  var morceaux = [], i = 0, d, f;
+  while((d = texte.indexOf(REPERE_DEBUT, i)) !== -1){
+    f = texte.indexOf(REPERE_FIN, d + REPERE_DEBUT.length);
+    if(f === -1) break;
+    morceaux.push(texte.slice(d + REPERE_DEBUT.length, f));
+    i = f + REPERE_FIN.length;
+  }
+  var utile = morceaux.length ? morceaux.join("\n") : texte;
+  BALISES_EXTERNES.forEach(function(re){ utile = utile.replace(re, ""); });
+  return cyrb53Texte(utile);
+}
+function cyrb53Texte(str){
   var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
   for(var i = 0, ch; i < str.length; i++){
     ch = str.charCodeAt(i);
@@ -15012,18 +15054,57 @@ function showUpdatePill(texteCle, avecBouton){
   pill.classList.add("show");
 }
 
+/* Journal des rechargements de mise à jour, conservé d'une page à l'autre :
+   c'est lui qui permet de repérer une boucle et d'y mettre fin. */
+function lireJournalMaj(){
+  try{
+    var j = JSON.parse(window.localStorage.getItem(UPDATE_LOG_KEY) || "[]");
+    return Array.isArray(j) ? j : [];
+  }catch(e){ return []; }
+}
+function ecrireJournalMaj(j){
+  try{ window.localStorage.setItem(UPDATE_LOG_KEY, JSON.stringify(j.slice(-8))); }catch(e){}
+}
+
+/* Au chargement : le rechargement précédent a-t-il apporté la version
+   attendue ? Si ce n'est pas le cas, ou si les rechargements s'enchaînent,
+   le contenu servi n'est pas fiable pour l'instant : on suspend les
+   rechargements automatiques jusqu'à la fin de la fenêtre d'observation. */
+(function verifierDernierRechargement(){
+  var j = lireJournalMaj(), now = Date.now();
+  var dernier = j[j.length - 1];
+  if(dernier && !dernier.vu){
+    dernier.vu = true;
+    if(APP_VERSION && dernier.to && now - dernier.at < 2 * 60 * 1000 && APP_VERSION !== dernier.to) dernier.rate = true;
+    ecrireJournalMaj(j);
+  }
+  var recents = j.filter(function(e){ return e && now - e.at < UPDATE_RELOAD_WINDOW; });
+  var rate = recents.some(function(e){ return e.rate; });
+  if(rate || recents.length >= UPDATE_MAX_RELOADS){
+    updateSuspendedUntil = recents[recents.length - 1].at + UPDATE_RELOAD_WINDOW;
+  }
+})();
+
 function applyUpdateNow(){
   if(updateWaitTimer){ clearInterval(updateWaitTimer); updateWaitTimer = null; }
   try{
     window.sessionStorage.setItem(RESUME_KEY, JSON.stringify({ page: currentPage, y: window.scrollY || 0, at: Date.now() }));
   }catch(e){}
+  var j = lireJournalMaj();
+  j.push({ from: updateBaseline, to: updateTarget, at: Date.now() });
+  ecrireJournalMaj(j);
   showUpdatePill("upd.applying", false);
   setTimeout(function(){ window.location.reload(); }, 450);
 }
 
-function scheduleUpdate(){
+function scheduleUpdate(target){
   if(updatePending) return;
+  /* Garde-fou : rechargements suspendus (voir verifierDernierRechargement).
+     Le service worker a déjà mis la nouvelle version de côté ; elle
+     s'affichera à la prochaine ouverture de l'application. */
+  if(Date.now() < updateSuspendedUntil) return;
   updatePending = true;
+  updateTarget = target || null;
   if(updateSafeNow()){ applyUpdateNow(); return; }
   /* Pas maintenant : on guette le premier moment favorable. Si l'attente se
      prolonge (une fiche reste ouverte), on le signale discrètement, avec la
@@ -15035,33 +15116,47 @@ function scheduleUpdate(){
   }, 1000);
 }
 
-function handleVersionInfo(d){
+function handleVersionInfo(d, confirmation){
   if(!d || !d.version) return;
+  /* Réseau injoignable : le service worker ne connaît que sa copie locale,
+     qui ne dit rien d'une éventuelle version plus récente. */
+  if(d.online === false) return;
   if(!updateBaseline){
     updateBaseline = d.version;
     renderVersionLine();
     return;
   }
-  if(d.version !== updateBaseline) scheduleUpdate();
+  if(d.version === updateBaseline){ updateCandidate = null; return; }
+  /* Version différente : on ne la retient que si une seconde lecture, un
+     peu plus tard, donne exactement la même. Un contenu qui change à chaque
+     requête ne passe donc jamais pour une nouvelle version. */
+  if(d.version === updateCandidate){ scheduleUpdate(d.version); return; }
+  updateCandidate = d.version;
+  if(!confirmation) setTimeout(function(){ checkForUpdate(true, true); }, UPDATE_CONFIRM_DELAY);
 }
 
-function checkForUpdate(force){
+function checkForUpdate(force, confirmation){
   if(updatePending) return;
   if(!force && Date.now() - lastUpdateCheck < 20000) return;
   if(navigator.onLine === false) return;
   lastUpdateCheck = Date.now();
-  if(swRegistration){ try{ swRegistration.update().catch(function(){}); }catch(e){} }
+  /* Recherche d'un nouveau sw.js, espacée : chaque installation retélécharge
+     l'application, et une installation déclenche elle-même une vérification. */
+  if(swRegistration && !confirmation && Date.now() - lastSwUpdate > SW_UPDATE_MIN_GAP){
+    lastSwUpdate = Date.now();
+    try{ swRegistration.update().catch(function(){}); }catch(e){}
+  }
   var ctrl = navigator.serviceWorker && navigator.serviceWorker.controller;
   if(ctrl && typeof MessageChannel !== "undefined"){
     var canal = new MessageChannel();
-    canal.port1.onmessage = function(ev){ handleVersionInfo(ev.data); };
+    canal.port1.onmessage = function(ev){ handleVersionInfo(ev.data, confirmation); };
     try{ ctrl.postMessage({ type: "check" }, [canal.port2]); }catch(e){}
     return;
   }
   if(!/^https?:$/.test(location.protocol)) return;
   fetch(location.href.split("#")[0], { cache: "no-store", credentials: "same-origin" })
     .then(function(r){ return r.ok ? r.text() : null; })
-    .then(function(texte){ if(texte) handleVersionInfo({ version: empreinteTexte(texte) }); })
+    .then(function(texte){ if(texte) handleVersionInfo({ version: empreinteTexte(texte) }, confirmation); })
     .catch(function(){});
 }
 
@@ -15085,10 +15180,14 @@ function initServiceWorker(){
     setTimeout(function(){ checkForUpdate(true); }, 5000);
   });
   navigator.serviceWorker.addEventListener("controllerchange", function(){
-    /* Première prise en main : la page est déjà à jour, rien à recharger.
-       Ensuite, un changement de service worker signifie une mise à jour. */
-    if(swHadController) scheduleUpdate();
-    else { swHadController = true; swOfflineReady = true; renderVersionLine(); checkForUpdate(true); }
+    /* Un nouveau service worker a pris la main. Cela ne veut pas dire que
+       l'application a changé : on vérifie simplement sa version, sans
+       recharger d'office. (Recharger à chaque changement de service worker
+       bouclait sans fin quand celui-ci est réinstallé à chaque chargement,
+       comme le fait l'option « Update on reload » des outils de
+       développement du navigateur.) */
+    swHadController = true; swOfflineReady = true; renderVersionLine();
+    checkForUpdate(true);
   });
   setTimeout(function(){ checkForUpdate(true); }, 4000);
 }
@@ -15279,5 +15378,5 @@ setInterval(function(){
 })();
 
 </script>
-</body>
+<!--/@app--></body>
 </html>

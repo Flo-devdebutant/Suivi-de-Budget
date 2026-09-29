@@ -10,7 +10,8 @@
       version en ligne est récupérée en arrière-plan.
 
    2. MISES À JOUR AUTOMATIQUES. Aucun numéro de version à tenir à la main :
-      l'empreinte (hachage) du fichier fait office de version. La page la
+      l'empreinte (hachage) du contenu de l'application fait office de
+      version. La page la
       reçoit dans <meta name="app-version">, et demande régulièrement au
       service worker de comparer avec la version en ligne. Si elles diffèrent,
       la nouvelle version est mise en cache et la page se recharge d'elle-même
@@ -32,7 +33,7 @@ var NETWORK_TIMEOUT = 3500;
 
 /* Empreinte rapide d'un texte (cyrb53). Pas besoin d'une fonction
    cryptographique : il s'agit seulement de savoir si le fichier a changé. */
-function empreinte(str){
+function cyrb53(str){
   var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
   for(var i = 0, ch; i < str.length; i++){
     ch = str.charCodeAt(i);
@@ -44,6 +45,36 @@ function empreinte(str){
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
   h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+/* Empreinte de l'application elle-même, et non de la page telle qu'elle
+   arrive. Un intermédiaire peut en effet modifier la page à chaque requête :
+   un antivirus qui analyse le trafic (Kaspersky, Avast…) y insère un script
+   dont l'adresse change à chaque fois, un proxy ou un CDN y ajoute ses
+   propres balises. L'empreinte du fichier entier changeait alors à chaque
+   vérification, et l'application se rechargeait sans fin.
+   On ne retient donc que ce qui se trouve entre les repères <!--@app--> et
+   <!--/@app--> (collés aux balises <head> et <body>, là où ces ajouts se
+   font), sans les scripts ni les feuilles de style externes : index.html
+   n'en contient aucun, ils viennent forcément d'ailleurs.
+   ⚠ La même fonction existe dans index.html (empreinteTexte) : les deux
+   doivent rester identiques. */
+var REPERE_DEBUT = "<!--@app-->", REPERE_FIN = "<!--/@app-->";
+var BALISES_EXTERNES = [
+  /<script\b[^>]*\bsrc\s*=\s*["']?(?:https?:)?\/\/[^>]*>\s*<\/script\s*>/gi,
+  /<link\b[^>]*\bhref\s*=\s*["']?(?:https?:)?\/\/[^>]*>/gi
+];
+function empreinte(texte){
+  var morceaux = [], i = 0, d, f;
+  while((d = texte.indexOf(REPERE_DEBUT, i)) !== -1){
+    f = texte.indexOf(REPERE_FIN, d + REPERE_DEBUT.length);
+    if(f === -1) break;
+    morceaux.push(texte.slice(d + REPERE_DEBUT.length, f));
+    i = f + REPERE_FIN.length;
+  }
+  var utile = morceaux.length ? morceaux.join("\n") : texte;
+  BALISES_EXTERNES.forEach(function(re){ utile = utile.replace(re, ""); });
+  return cyrb53(utile);
 }
 
 /* La page d'application, et elle seule : la racine du dossier ou index.html. */
@@ -84,8 +115,11 @@ function recupererEnLigne(){
 function lireCache(){
   return caches.open(SHELL_CACHE).then(function(cache){ return cache.match(SHELL_URL); }).then(function(rep){
     if(!rep) return null;
+    /* L'empreinte est recalculée plutôt que lue dans l'en-tête enregistré :
+       une copie rangée par une version précédente de ce fichier porterait
+       une empreinte calculée autrement. */
     return rep.text().then(function(texte){
-      return { texte: texte, version: rep.headers.get("X-App-Version") || empreinte(texte) };
+      return { texte: texte, version: empreinte(texte) };
     });
   });
 }
